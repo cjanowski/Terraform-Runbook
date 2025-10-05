@@ -1,16 +1,16 @@
-# Kubernetes SRE Runbook
+# Terraform SRE Runbook
 
 ## Table of Contents
 1. [Emergency Contacts](#emergency-contacts)
-2. [Cluster Health Checks](#cluster-health-checks)
+2. [State Management](#state-management)
 3. [Common Issues and Resolutions](#common-issues-and-resolutions)
-4. [Node Management](#node-management)
-5. [Pod Troubleshooting](#pod-troubleshooting)
-6. [Network Issues](#network-issues)
-7. [Storage Issues](#storage-issues)
-8. [Performance Troubleshooting](#performance-troubleshooting)
-9. [Security Incidents](#security-incidents)
-10. [Backup and Recovery](#backup-and-recovery)
+4. [Drift Detection and Remediation](#drift-detection-and-remediation)
+5. [Import and Migration](#import-and-migration)
+6. [Disaster Recovery](#disaster-recovery)
+7. [Best Practices](#best-practices)
+8. [Troubleshooting Commands](#troubleshooting-commands)
+9. [Rollback Procedures](#rollback-procedures)
+10. [Security Incidents](#security-incidents)
 
 ---
 
@@ -19,663 +19,1045 @@
 | Role | Contact | Escalation Path |
 |------|---------|----------------|
 | On-Call Engineer | [Contact Info] | Primary |
-| Team Lead | [Contact Info] | Secondary |
-| Platform Team | [Contact Info] | Tertiary |
-| Cloud Provider Support | [Support Number] | Emergency |
+| Infrastructure Team Lead | [Contact Info] | Secondary |
+| Cloud Platform Team | [Contact Info] | Tertiary |
+| Vendor Support | [Support Number] | Emergency |
 
 ---
 
-## Cluster Health Checks
+## State Management
 
-### Quick Health Assessment
+### State File Corruption
 
+**Symptoms:**
+- `terraform plan` fails with state parsing errors
+- Unable to read state file
+- State file contains invalid JSON
+
+**Diagnosis:**
 ```bash
-# Check cluster nodes
-kubectl get nodes
+# Validate state file
+terraform state list
 
-# Check system pods
-kubectl get pods -n kube-system
+# Check state file directly
+cat terraform.tfstate | jq .
 
-# Check all namespaces for issues
-kubectl get pods --all-namespaces | grep -v Running
+# Check remote state
+terraform state pull > current-state.json
+cat current-state.json | jq .
 
-# Check cluster component status
-kubectl get componentstatuses
+# View state history (if using versioned backend)
+# For S3: aws s3api list-object-versions --bucket <bucket-name> --prefix <path>
 ```
 
-### Detailed Health Metrics
+**Resolution:**
+1. Pull latest working state from backup
+2. Restore from version control if state is committed
+3. Use backend versioning to restore previous version
+4. Rebuild state using `terraform import` if no backup available
 
 ```bash
-# Check node resource usage
-kubectl top nodes
+# Backup current state before any fixes
+terraform state pull > backup-$(date +%Y%m%d-%H%M%S).json
 
-# Check pod resource usage
-kubectl top pods --all-namespaces
+# For S3 backend with versioning
+aws s3api get-object \
+  --bucket <bucket-name> \
+  --key <state-key> \
+  --version-id <version-id> \
+  restored-state.json
 
-# View cluster events
-kubectl get events --all-namespaces --sort-by='.lastTimestamp'
+# Push restored state
+terraform state push restored-state.json
+```
 
-# Check API server health
-kubectl get --raw /healthz
+---
+
+### State Lock Issues
+
+**Symptoms:**
+- Error: "Error acquiring the state lock"
+- Operations timeout waiting for lock
+- Lock ID shown in error message
+
+**Diagnosis:**
+```bash
+# Check backend configuration
+cat backend.tf
+
+# For DynamoDB (AWS)
+aws dynamodb get-item \
+  --table-name <lock-table> \
+  --key '{"LockID":{"S":"<state-path>"}}'
+
+# For Consul
+consul kv get <lock-path>
+
+# Check who has the lock and when
+terraform force-unlock <lock-id>  # Use with caution!
+```
+
+**Resolution:**
+1. Verify no active terraform operations are running
+2. Check if CI/CD pipeline is holding lock
+3. Investigate if previous operation crashed
+4. Force unlock only if certain no operations are running
+5. Clean up zombie locks from failed operations
+
+```bash
+# Force unlock (DANGEROUS - ensure no one is running terraform)
+terraform force-unlock <lock-id>
+
+# For DynamoDB
+aws dynamodb delete-item \
+  --table-name <lock-table> \
+  --key '{"LockID":{"S":"<state-path>"}}'
+
+# Verify unlock successful
+terraform plan
+```
+
+---
+
+### State Drift from Manual Changes
+
+**Symptoms:**
+- `terraform plan` shows unexpected changes
+- Resources show as needing updates when none were made
+- Differences between actual infrastructure and state
+
+**Diagnosis:**
+```bash
+# Run plan to see drift
+terraform plan
+
+# Refresh state to sync with reality
+terraform refresh
+
+# Show specific resource
+terraform state show <resource-address>
+
+# Compare with actual infrastructure
+# AWS example:
+aws ec2 describe-instances --instance-ids <id>
+```
+
+**Resolution:**
+1. Identify what changed manually
+2. Update terraform code to match reality, or
+3. Let terraform revert manual changes
+4. Import resources if created outside terraform
+5. Implement policy to prevent manual changes
+
+```bash
+# Update state to match reality without changes
+terraform apply -refresh-only
+
+# Import manually created resource
+terraform import <resource-type>.<name> <resource-id>
+
+# Remove resource from state (if no longer managed)
+terraform state rm <resource-address>
 ```
 
 ---
 
 ## Common Issues and Resolutions
 
-### Issue: Pods Stuck in Pending State
+### Issue: Terraform Init Fails
 
 **Symptoms:**
-- Pods remain in Pending state
-- Applications fail to start
+- Unable to initialize working directory
+- Backend configuration errors
+- Provider download failures
 
 **Diagnosis:**
 ```bash
-# Check pod details
-kubectl describe pod <pod-name> -n <namespace>
+# Run init with debug output
+TF_LOG=DEBUG terraform init
 
-# Check for resource constraints
-kubectl describe nodes | grep -A 5 "Allocated resources"
+# Check backend configuration
+cat backend.tf
 
-# Check for PVC issues
-kubectl get pvc -n <namespace>
+# Verify credentials
+# AWS
+aws sts get-caller-identity
+
+# GCP
+gcloud auth list
+
+# Azure
+az account show
+
+# Check network connectivity
+curl -I https://registry.terraform.io
 ```
 
 **Resolution:**
-1. Check if there are sufficient resources (CPU/Memory) on nodes
-2. Verify PersistentVolumeClaims are bound
-3. Check for node taints and pod tolerations
-4. Verify node affinity rules
-5. Scale cluster if resources are exhausted
-
 ```bash
-# If resource constrained, scale nodes (example for managed clusters)
-# AWS EKS
-eksctl scale nodegroup --cluster=<cluster-name> --name=<nodegroup-name> --nodes=<desired-count>
+# Clear .terraform directory and retry
+rm -rf .terraform .terraform.lock.hcl
+terraform init
 
-# GKE
-gcloud container clusters resize <cluster-name> --num-nodes=<count>
+# Reconfigure backend
+terraform init -reconfigure
+
+# Migrate state to new backend
+terraform init -migrate-state
+
+# Use specific provider versions
+terraform init -upgrade
+
+# Skip provider plugins (offline)
+terraform init -get-plugins=false
 ```
 
 ---
 
-### Issue: CrashLoopBackOff
+### Issue: Plan Shows Perpetual Drift
 
 **Symptoms:**
-- Pod repeatedly crashes and restarts
-- Application unavailable
+- Same resources show changes on every plan
+- Changes revert after apply
+- Computed attributes causing updates
 
 **Diagnosis:**
 ```bash
-# Check pod status
-kubectl get pod <pod-name> -n <namespace>
+# Run plan with detailed output
+terraform plan -out=tfplan
+terraform show tfplan
 
-# View pod logs
-kubectl logs <pod-name> -n <namespace> --previous
+# Check specific resource configuration
+terraform state show <resource-address>
 
-# Describe pod for events
-kubectl describe pod <pod-name> -n <namespace>
+# Look for lifecycle blocks and ignore_changes
+grep -r "ignore_changes" .
 
-# Check if liveness/readiness probes failing
-kubectl get pod <pod-name> -n <namespace> -o yaml | grep -A 10 "livenessProbe\|readinessProbe"
+# Check provider version compatibility
+terraform version
 ```
 
 **Resolution:**
-1. Review application logs for errors
-2. Check probe configurations (timeout, threshold)
-3. Verify environment variables and ConfigMaps
-4. Check resource limits (OOMKilled)
-5. Verify secrets are correctly mounted
-6. Roll back to previous working version if needed
+1. Add `ignore_changes` for computed/API-updated attributes
+2. Use `lifecycle` blocks appropriately
+3. Update provider to latest version
+4. Check for default values conflicting with API
 
-```bash
-# Rollback deployment
-kubectl rollout undo deployment/<deployment-name> -n <namespace>
+```hcl
+# Example: Ignore changes to certain attributes
+resource "aws_instance" "example" {
+  # ... configuration ...
 
-# Check rollout status
-kubectl rollout status deployment/<deployment-name> -n <namespace>
+  lifecycle {
+    ignore_changes = [
+      tags["LastModified"],
+      user_data,
+      ami
+    ]
+  }
+}
 ```
 
 ---
 
-### Issue: ImagePullBackOff
+### Issue: Provider Authentication Failures
 
 **Symptoms:**
-- Pods cannot pull container images
-- New deployments fail
+- Authentication errors during plan/apply
+- Credential validation failures
+- Timeout errors connecting to API
 
 **Diagnosis:**
 ```bash
-# Check pod events
-kubectl describe pod <pod-name> -n <namespace>
+# Check environment variables
+env | grep AWS_
+env | grep GOOGLE_
+env | grep ARM_
 
-# Verify image name and tag
-kubectl get pod <pod-name> -n <namespace> -o jsonpath='{.spec.containers[*].image}'
+# Verify credentials directly
+# AWS
+aws sts get-caller-identity
 
-# Check image pull secrets
-kubectl get secrets -n <namespace>
+# GCP
+gcloud auth application-default print-access-token
+
+# Azure
+az account show
+
+# Check provider configuration
+terraform providers
 ```
 
 **Resolution:**
-1. Verify image exists in registry
-2. Check image pull secrets are correctly configured
-3. Verify registry credentials are valid
-4. Check network connectivity to registry
-5. Verify node has sufficient disk space
-
 ```bash
-# Create image pull secret if missing
-kubectl create secret docker-registry <secret-name> \
-  --docker-server=<registry-url> \
-  --docker-username=<username> \
-  --docker-password=<password> \
-  --docker-email=<email> \
-  -n <namespace>
+# Set credentials via environment variables
+# AWS
+export AWS_ACCESS_KEY_ID="<key>"
+export AWS_SECRET_ACCESS_KEY="<secret>"
+export AWS_REGION="us-east-1"
 
-# Update deployment to use secret
-kubectl patch serviceaccount default -n <namespace> \
-  -p '{"imagePullSecrets": [{"name": "<secret-name>"}]}'
+# GCP
+export GOOGLE_APPLICATION_CREDENTIALS="/path/to/keyfile.json"
+
+# Azure
+export ARM_CLIENT_ID="<client-id>"
+export ARM_CLIENT_SECRET="<client-secret>"
+export ARM_SUBSCRIPTION_ID="<subscription-id>"
+export ARM_TENANT_ID="<tenant-id>"
+
+# Use assume role (AWS)
+export AWS_PROFILE="<profile-name>"
+
+# Refresh credentials
+# AWS SSO
+aws sso login --profile <profile>
+
+# Re-run terraform
+terraform plan
 ```
 
 ---
 
-## Node Management
+### Issue: Dependency Errors
 
-### Node is NotReady
-
-**Diagnosis:**
-```bash
-# Check node status
-kubectl get nodes
-
-# Describe problematic node
-kubectl describe node <node-name>
-
-# Check node conditions
-kubectl get node <node-name> -o jsonpath='{.status.conditions[?(@.status=="True")]}'
-
-# SSH to node and check kubelet
-# systemctl status kubelet
-# journalctl -u kubelet -n 100
-```
-
-**Resolution:**
-1. Check kubelet service status on the node
-2. Verify network connectivity
-3. Check disk pressure or memory pressure
-4. Restart kubelet if necessary
-5. Cordon and drain node if issues persist, then replace
-
-```bash
-# Cordon node (prevent new pods)
-kubectl cordon <node-name>
-
-# Drain node (evict pods gracefully)
-kubectl drain <node-name> --ignore-daemonsets --delete-emptydir-data
-
-# After fixing, uncordon
-kubectl uncordon <node-name>
-```
-
-### High Node Resource Usage
+**Symptoms:**
+- "Resource X depends on Y but Y is not in state"
+- Cycle errors in resource graph
+- Resources created in wrong order
 
 **Diagnosis:**
 ```bash
-# Check top resource consumers
-kubectl top pods --all-namespaces | sort -k 3 -rn | head -20
+# Generate dependency graph
+terraform graph | dot -Tpng > graph.png
 
-# Check node allocatable vs requested
-kubectl describe node <node-name> | grep -A 5 "Allocated resources"
+# Show resources and dependencies
+terraform state list
+terraform state show <resource>
+
+# Validate configuration
+terraform validate
+
+# Check for circular dependencies
+terraform graph | grep cycle
 ```
 
 **Resolution:**
-1. Identify pods consuming excessive resources
-2. Check if pods have appropriate resource limits
-3. Scale down non-critical workloads if needed
-4. Add nodes to cluster
-5. Optimize application resource usage
+1. Add explicit `depends_on` where needed
+2. Remove circular dependencies
+3. Split configurations into separate workspaces
+4. Use data sources instead of resource references
+5. Refactor module dependencies
 
----
+```hcl
+# Example: Explicit dependency
+resource "aws_instance" "app" {
+  # ... configuration ...
 
-## Pod Troubleshooting
-
-### Debugging Running Pods
-
-```bash
-# Execute commands in pod
-kubectl exec -it <pod-name> -n <namespace> -- /bin/sh
-
-# For multi-container pods
-kubectl exec -it <pod-name> -n <namespace> -c <container-name> -- /bin/sh
-
-# View logs (follow mode)
-kubectl logs -f <pod-name> -n <namespace>
-
-# View logs for previous container instance
-kubectl logs <pod-name> -n <namespace> --previous
-
-# Copy files from pod
-kubectl cp <namespace>/<pod-name>:/path/to/file ./local-file
-
-# Port forward for debugging
-kubectl port-forward <pod-name> -n <namespace> 8080:80
-```
-
-### Debugging Pods with Ephemeral Containers
-
-```bash
-# Add ephemeral debug container (Kubernetes 1.23+)
-kubectl debug <pod-name> -n <namespace> -it --image=busybox --target=<container-name>
-
-# Create debug pod that copies target pod
-kubectl debug <pod-name> -n <namespace> --copy-to=<debug-pod-name> --container=<container-name>
+  depends_on = [
+    aws_security_group.app,
+    aws_db_instance.primary
+  ]
+}
 ```
 
 ---
 
-## Network Issues
+### Issue: Timeout Errors
 
-### Pod-to-Pod Communication Failures
-
-**Diagnosis:**
-```bash
-# Check network policies
-kubectl get networkpolicies -n <namespace>
-
-# Describe network policy
-kubectl describe networkpolicy <policy-name> -n <namespace>
-
-# Check pod IPs
-kubectl get pods -n <namespace> -o wide
-
-# Test connectivity from pod
-kubectl exec -it <source-pod> -n <namespace> -- ping <destination-pod-ip>
-kubectl exec -it <source-pod> -n <namespace> -- curl <service-name>.<namespace>.svc.cluster.local
-```
-
-**Resolution:**
-1. Verify network policies allow traffic
-2. Check CNI plugin health
-3. Verify DNS resolution is working
-4. Check firewall rules (cloud provider level)
-5. Validate service endpoints
-
-```bash
-# Check service endpoints
-kubectl get endpoints <service-name> -n <namespace>
-
-# Check DNS resolution
-kubectl run -it --rm debug --image=busybox --restart=Never -- nslookup <service-name>.<namespace>.svc.cluster.local
-```
-
-### Service Not Accessible
+**Symptoms:**
+- Operations timeout during apply
+- Resource creation takes too long
+- Waiter timeouts
 
 **Diagnosis:**
 ```bash
-# Check service configuration
-kubectl get svc <service-name> -n <namespace> -o yaml
+# Check resource timeouts
+terraform show | grep timeout
 
-# Check endpoints
-kubectl get endpoints <service-name> -n <namespace>
+# Run with debug logging
+TF_LOG=DEBUG terraform apply
 
-# Check pod labels match service selector
-kubectl get pods -n <namespace> --show-labels
+# Check cloud provider status
+# AWS
+aws health describe-events
+
+# Check for rate limiting
+# AWS
+aws service-quotas list-service-quotas --service-code ec2
 ```
 
 **Resolution:**
-1. Verify service selector matches pod labels
-2. Check target port matches container port
-3. Verify pods are running and ready
-4. Check network policies
-5. For LoadBalancer services, check cloud provider configuration
-
----
-
-## Storage Issues
-
-### PersistentVolumeClaim Stuck in Pending
-
-**Diagnosis:**
 ```bash
-# Check PVC status
-kubectl get pvc -n <namespace>
+# Increase timeouts in resource
+terraform {
+  required_providers {
+    aws = {
+      source  = "hashicorp/aws"
+      version = "~> 5.0"
+    }
+  }
+}
 
-# Describe PVC
-kubectl describe pvc <pvc-name> -n <namespace>
+# Resource-level timeout
+resource "aws_db_instance" "example" {
+  # ... configuration ...
 
-# Check available PVs
-kubectl get pv
+  timeouts {
+    create = "60m"
+    update = "60m"
+    delete = "60m"
+  }
+}
 
-# Check storage classes
-kubectl get storageclass
-```
+# Apply with parallelism adjustment
+terraform apply -parallelism=1
 
-**Resolution:**
-1. Verify StorageClass exists and is properly configured
-2. Check if dynamic provisioning is enabled
-3. Verify sufficient storage quota in cloud provider
-4. Check PV access modes match PVC requirements
-5. Manually create PV if using static provisioning
-
-```bash
-# Check storage class details
-kubectl describe storageclass <storage-class-name>
-
-# Check PV reclaim policy
-kubectl get pv -o custom-columns=NAME:.metadata.name,RECLAIM:.spec.persistentVolumeReclaimPolicy
-```
-
-### Disk Pressure on Nodes
-
-**Diagnosis:**
-```bash
-# Check node conditions
-kubectl describe node <node-name> | grep DiskPressure
-
-# Check disk usage on node (requires SSH access)
-# df -h
-# du -sh /var/lib/kubelet/*
-# du -sh /var/lib/docker/*
-```
-
-**Resolution:**
-1. Clean up unused images and containers
-2. Remove old logs
-3. Increase disk size
-4. Implement log rotation
-5. Set up monitoring and alerts
-
-```bash
-# Clean up on node (if accessible)
-# docker system prune -a -f
-# crictl rmi --prune
-
-# Via kubectl
-kubectl get pods --all-namespaces -o wide | grep <node-name>
-# Consider evicting non-critical pods
+# Increase provider timeout
+provider "aws" {
+  max_retries = 10
+  # ... other config ...
+}
 ```
 
 ---
 
-## Performance Troubleshooting
+## Drift Detection and Remediation
 
-### High CPU Usage
-
-**Diagnosis:**
-```bash
-# Identify high CPU pods
-kubectl top pods --all-namespaces | sort -k 3 -rn | head -20
-
-# Check pod resource limits
-kubectl get pod <pod-name> -n <namespace> -o jsonpath='{.spec.containers[*].resources}'
-
-# Profile application (if supported)
-kubectl exec -it <pod-name> -n <namespace> -- <profiling-command>
-```
-
-**Resolution:**
-1. Scale application horizontally if CPU-bound
-2. Adjust resource limits and requests
-3. Optimize application code
-4. Implement HorizontalPodAutoscaler
-5. Consider vertical pod autoscaling
+### Detecting Drift
 
 ```bash
-# Create HPA
-kubectl autoscale deployment <deployment-name> -n <namespace> \
-  --cpu-percent=70 --min=2 --max=10
+# Standard drift check
+terraform plan -detailed-exitcode
+# Exit code 0: no changes
+# Exit code 1: error
+# Exit code 2: changes detected
 
-# Check HPA status
-kubectl get hpa -n <namespace>
+# Refresh only mode (safe)
+terraform plan -refresh-only
+
+# Generate drift report
+terraform plan -out=plan.tfplan
+terraform show -json plan.tfplan > drift-report.json
+
+# Compare specific resources
+terraform state show <resource> > current-state.txt
+# Compare with expected configuration
 ```
 
-### High Memory Usage
+### Automated Drift Detection
 
-**Diagnosis:**
 ```bash
-# Identify high memory pods
-kubectl top pods --all-namespaces | sort -k 4 -rn | head -20
+# Scheduled drift detection script
+#!/bin/bash
+cd /path/to/terraform
+terraform init -backend=true
+terraform plan -detailed-exitcode > /dev/null 2>&1
+EXIT_CODE=$?
 
-# Check for OOMKilled pods
-kubectl get pods --all-namespaces | grep OOMKilled
-
-# Check memory limits
-kubectl get pod <pod-name> -n <namespace> -o jsonpath='{.spec.containers[*].resources.limits.memory}'
+if [ $EXIT_CODE -eq 2 ]; then
+    echo "DRIFT DETECTED"
+    terraform plan > drift-report-$(date +%Y%m%d).txt
+    # Send alert
+    # Notify team
+fi
 ```
 
-**Resolution:**
-1. Check for memory leaks in application
-2. Increase memory limits if legitimate usage
-3. Implement proper garbage collection
-4. Use memory profiling tools
-5. Consider using Vertical Pod Autoscaler
+### Remediating Drift
+
+```bash
+# Option 1: Apply to fix drift
+terraform apply -auto-approve
+
+# Option 2: Update state to match reality
+terraform apply -refresh-only -auto-approve
+
+# Option 3: Update code to match reality
+# Edit .tf files then apply
+
+# Option 4: Import external changes
+terraform import <resource_type>.<name> <id>
+```
+
+---
+
+## Import and Migration
+
+### Importing Existing Resources
+
+```bash
+# List resources to import
+# Identify resource type and ID from cloud provider
+
+# Import single resource
+terraform import aws_instance.example i-1234567890abcdef0
+
+# Import with module path
+terraform import module.vpc.aws_vpc.main vpc-12345678
+
+# Generate import blocks (Terraform 1.5+)
+terraform plan -generate-config-out=generated.tf
+
+# Bulk import using for loop
+for instance in $(aws ec2 describe-instances --query 'Reservations[].Instances[].InstanceId' --output text); do
+  terraform import "aws_instance.imported[\"$instance\"]" "$instance"
+done
+```
+
+### State Migration
+
+```bash
+# Migrate from local to remote backend
+# 1. Add backend configuration
+cat >> backend.tf << EOF
+terraform {
+  backend "s3" {
+    bucket = "my-terraform-state"
+    key    = "prod/terraform.tfstate"
+    region = "us-east-1"
+  }
+}
+EOF
+
+# 2. Initialize with migration
+terraform init -migrate-state
+
+# Migrate between remote backends
+# 1. Update backend.tf with new configuration
+# 2. Run migration
+terraform init -migrate-state
+
+# Manual state migration
+terraform state pull > local-backup.tfstate
+# Update backend.tf
+terraform init
+terraform state push local-backup.tfstate
+```
+
+### Moving Resources Between States
+
+```bash
+# Move resource within same state
+terraform state mv aws_instance.old_name aws_instance.new_name
+
+# Move resource to module
+terraform state mv aws_instance.example module.app.aws_instance.example
+
+# Move between states
+# Source state
+terraform state pull > temp-state.json
+terraform state rm aws_instance.example
+
+# Destination state
+cd ../destination
+terraform state pull > dest-backup.json
+# Extract resource from temp-state.json and add to dest state
+terraform state push modified-state.json
+```
+
+---
+
+## Disaster Recovery
+
+### State Recovery Procedures
+
+**Complete State Loss:**
+
+```bash
+# Step 1: Check for backups
+# S3 versioning
+aws s3api list-object-versions --bucket <bucket> --prefix <path>
+
+# Terraform Cloud/Enterprise
+# Use UI or API to download previous state versions
+
+# Step 2: If no backup, rebuild via import
+# Create resource configurations
+# Import all resources
+terraform import <resource_type>.<name> <id>
+
+# Step 3: Verify state
+terraform plan  # Should show no changes
+
+# Step 4: Create backup
+terraform state pull > recovered-state-$(date +%Y%m%d).json
+```
+
+### Corrupted State Recovery
+
+```bash
+# Attempt automatic fix
+terraform state pull | jq . > fixed-state.json
+terraform state push fixed-state.json
+
+# Manual recovery
+# 1. Backup current state
+terraform state pull > corrupted-$(date +%Y%m%d).json
+
+# 2. Get previous version
+# For S3
+aws s3api get-object \
+  --bucket <bucket> \
+  --key <key> \
+  --version-id <previous-version> \
+  recovered-state.json
+
+# 3. Push recovered state
+terraform state push recovered-state.json
+
+# 4. Verify
+terraform plan
+```
+
+### Emergency Rollback
+
+```bash
+# Quick rollback steps
+# 1. Get state from before apply
+terraform state pull > current-broken-state.json
+
+# 2. Restore previous state
+# From S3 versioning
+aws s3api get-object \
+  --bucket <bucket> \
+  --key <key> \
+  --version-id <previous-version> \
+  previous-state.json
+
+terraform state push previous-state.json
+
+# 3. Revert code changes
+git log --oneline
+git checkout <previous-commit> -- .
+
+# 4. Apply to fix infrastructure
+terraform plan
+terraform apply
+
+# 5. Document incident
+```
+
+---
+
+## Best Practices
+
+### Pre-Apply Checklist
+
+- [ ] Run `terraform fmt` to format code
+- [ ] Run `terraform validate` to check syntax
+- [ ] Review `terraform plan` output thoroughly
+- [ ] Check for destructive changes (deletions, recreations)
+- [ ] Verify credentials and permissions
+- [ ] Ensure state lock is not held
+- [ ] Backup current state
+- [ ] Document changes in commit message
+- [ ] Notify team of upcoming changes
+- [ ] Have rollback plan ready
+
+### Safe Apply Procedure
+
+```bash
+# Step 1: Format and validate
+terraform fmt -recursive
+terraform validate
+
+# Step 2: Generate plan
+terraform plan -out=tfplan
+
+# Step 3: Review plan
+terraform show tfplan
+
+# Step 4: Save plan for review
+terraform show -json tfplan > plan-review.json
+
+# Step 5: Apply plan
+terraform apply tfplan
+
+# Step 6: Verify
+terraform plan  # Should show no changes
+
+# Step 7: Backup state
+terraform state pull > backup-post-apply-$(date +%Y%m%d).json
+```
+
+### State Backup Strategy
+
+```bash
+# Automated backup script
+#!/bin/bash
+BACKUP_DIR="/backup/terraform"
+PROJECT_NAME="my-project"
+DATE=$(date +%Y%m%d-%H%M%S)
+
+cd /path/to/terraform
+
+# Pull state
+terraform state pull > "${BACKUP_DIR}/${PROJECT_NAME}-${DATE}.json"
+
+# Keep only last 30 days
+find "${BACKUP_DIR}" -name "${PROJECT_NAME}-*.json" -mtime +30 -delete
+
+# Upload to S3 for redundancy
+aws s3 cp "${BACKUP_DIR}/${PROJECT_NAME}-${DATE}.json" \
+  "s3://backup-bucket/terraform/${PROJECT_NAME}/${DATE}.json"
+```
+
+---
+
+## Troubleshooting Commands
+
+### State Inspection
+
+```bash
+# List all resources
+terraform state list
+
+# Show specific resource
+terraform state show <resource-address>
+
+# Show all attributes of resource
+terraform state show -json <resource-address> | jq .
+
+# Find resources matching pattern
+terraform state list | grep <pattern>
+
+# Show outputs
+terraform output
+terraform output -json
+terraform output <output-name>
+```
+
+### Configuration Debugging
+
+```bash
+# Enable debug logging
+export TF_LOG=DEBUG
+export TF_LOG_PATH=terraform-debug.log
+
+# Trace level (very verbose)
+export TF_LOG=TRACE
+
+# Component-specific logging
+export TF_LOG_CORE=TRACE
+export TF_LOG_PROVIDER=TRACE
+
+# Console output formatting
+terraform console
+> var.my_variable
+> local.my_local
+> module.my_module.output_name
+
+# Validate configuration
+terraform validate -json
+
+# Check formatting issues
+terraform fmt -check -recursive
+```
+
+### Provider Debugging
+
+```bash
+# Show provider versions
+terraform providers
+
+# Lock provider versions
+terraform providers lock
+
+# Upgrade providers
+terraform init -upgrade
+
+# Show provider schema
+terraform providers schema -json > schema.json
+
+# Test provider credentials
+terraform console
+> provider::aws::region
+```
+
+### Plan Analysis
+
+```bash
+# Generate detailed plan
+terraform plan -out=tfplan
+
+# Show human-readable plan
+terraform show tfplan
+
+# Show JSON plan
+terraform show -json tfplan | jq .
+
+# Show specific resource changes
+terraform show -json tfplan | jq '.resource_changes[] | select(.address == "aws_instance.example")'
+
+# Count resource changes
+terraform show -json tfplan | jq '.resource_changes | group_by(.change.actions[0]) | map({action: .[0].change.actions[0], count: length})'
+
+# Find destructive changes
+terraform show -json tfplan | jq '.resource_changes[] | select(.change.actions[] | contains("delete"))'
+```
+
+---
+
+## Rollback Procedures
+
+### Code Rollback
+
+```bash
+# View recent commits
+git log --oneline -10
+
+# Revert to specific commit
+git checkout <commit-hash> -- .
+
+# Run plan to see changes
+terraform plan
+
+# Apply rollback
+terraform apply
+
+# If using branches
+git checkout main
+git revert <bad-commit-hash>
+git push
+```
+
+### State Rollback
+
+```bash
+# List state versions (S3 example)
+aws s3api list-object-versions \
+  --bucket <bucket> \
+  --prefix <state-key> \
+  --query 'Versions[*].[VersionId,LastModified]' \
+  --output table
+
+# Download specific version
+aws s3api get-object \
+  --bucket <bucket> \
+  --key <state-key> \
+  --version-id <version-id> \
+  rollback-state.json
+
+# Backup current state
+terraform state pull > before-rollback-$(date +%Y%m%d).json
+
+# Push rolled-back state
+terraform state push rollback-state.json
+
+# Verify
+terraform plan
+```
+
+### Partial Rollback
+
+```bash
+# Rollback specific resources only
+# 1. Get resource from old state
+cat old-state.json | jq '.resources[] | select(.type == "aws_instance" and .name == "example")'
+
+# 2. Remove from current state
+terraform state rm aws_instance.example
+
+# 3. Import with old configuration
+terraform import aws_instance.example <instance-id>
+
+# Or destroy and recreate
+terraform destroy -target=aws_instance.example
+git checkout <old-commit> -- instance.tf
+terraform apply -target=aws_instance.example
+```
 
 ---
 
 ## Security Incidents
 
-### Unauthorized Access Detected
+### Exposed Credentials in State
 
 **Immediate Actions:**
-1. Isolate affected pods/nodes
-2. Review audit logs
-3. Check for privilege escalation
-4. Rotate credentials and secrets
-5. Review RBAC policies
-
 ```bash
-# Check who has access
-kubectl auth can-i --list --as=<user>
+# 1. Rotate exposed credentials immediately
+# AWS example
+aws iam create-access-key --user-name <username>
+aws iam delete-access-key --access-key-id <old-key> --user-name <username>
 
-# Review RBAC
-kubectl get rolebindings,clusterrolebindings --all-namespaces -o wide
+# 2. Remove sensitive data from state if possible
+# This is difficult - state often needs sensitive data
 
-# Check pod security policies
-kubectl get psp
+# 3. Restrict state file access
+# S3 example
+aws s3api put-bucket-policy --bucket <bucket> --policy file://restrict-policy.json
 
-# Review audit logs (location varies by setup)
-# Example for managed clusters - check cloud provider logging
+# 4. Enable encryption at rest
+# S3
+aws s3api put-bucket-encryption \
+  --bucket <bucket> \
+  --server-side-encryption-configuration '{
+    "Rules": [{
+      "ApplyServerSideEncryptionByDefault": {
+        "SSEAlgorithm": "AES256"
+      }
+    }]
+  }'
+
+# 5. Audit access logs
+aws s3api get-bucket-logging --bucket <bucket>
 ```
 
-### Suspicious Pod Activity
+### Unauthorized State Access
 
-**Diagnosis:**
 ```bash
-# Check pod security context
-kubectl get pod <pod-name> -n <namespace> -o jsonpath='{.spec.securityContext}'
+# Check who accessed state
+# S3 access logs
+aws s3api get-bucket-logging --bucket <bucket>
+aws s3 cp s3://<log-bucket>/<prefix> . --recursive
 
-# Check container security context
-kubectl get pod <pod-name> -n <namespace> -o jsonpath='{.spec.containers[*].securityContext}'
+# CloudTrail for API calls
+aws cloudtrail lookup-events \
+  --lookup-attributes AttributeKey=ResourceName,AttributeValue=<bucket> \
+  --max-results 50
 
-# Review pod events
-kubectl get events -n <namespace> --field-selector involvedObject.name=<pod-name>
+# Review IAM policies
+aws iam get-role-policy --role-name <role> --policy-name <policy>
+
+# Restrict access
+aws s3api put-bucket-policy --bucket <bucket> --policy '{
+  "Version": "2012-10-17",
+  "Statement": [{
+    "Effect": "Deny",
+    "Principal": "*",
+    "Action": "s3:*",
+    "Resource": "arn:aws:s3:::<bucket>/*",
+    "Condition": {
+      "StringNotEquals": {
+        "aws:PrincipalAccount": "<account-id>"
+      }
+    }
+  }]
+}'
 ```
 
-**Actions:**
-1. Delete suspicious pods immediately
-2. Review deployment manifests
-3. Check image sources
-4. Review network traffic
-5. Scan for vulnerabilities
+### Malicious Changes Detected
 
 ```bash
-# Delete pod
-kubectl delete pod <pod-name> -n <namespace> --force --grace-period=0
+# 1. Lock state immediately
+# Enable required state lock if not already
 
-# Check image for vulnerabilities (using trivy as example)
-# trivy image <image-name>
-```
+# 2. Review recent changes
+terraform state pull | jq '.lineage, .serial'
+git log --all --source --since="1 week ago"
 
----
+# 3. Check for unauthorized resources
+terraform state list
+terraform state show <suspicious-resource>
 
-## Backup and Recovery
+# 4. Review Terraform logs
+cat terraform-debug.log | grep -A 5 "apply"
 
-### Backup Critical Resources
+# 5. Restore from known good state
+terraform state push <verified-backup>.json
 
-```bash
-# Backup all resources in namespace
-kubectl get all -n <namespace> -o yaml > backup-<namespace>-$(date +%Y%m%d).yaml
+# 6. Change all credentials
+# Rotate AWS keys, service account keys, etc.
 
-# Backup specific resource types
-kubectl get deployment,service,configmap,secret -n <namespace> -o yaml > backup-resources.yaml
-
-# Backup RBAC
-kubectl get clusterroles,clusterrolebindings,roles,rolebindings --all-namespaces -o yaml > backup-rbac.yaml
-
-# Backup persistent volumes
-kubectl get pv,pvc --all-namespaces -o yaml > backup-storage.yaml
-```
-
-### Restore from Backup
-
-```bash
-# Restore resources
-kubectl apply -f backup-<namespace>-<date>.yaml
-
-# Restore to specific namespace
-kubectl apply -f backup-resources.yaml -n <target-namespace>
-
-# Verify restoration
-kubectl get all -n <namespace>
-```
-
-### Disaster Recovery
-
-**Etcd Backup (if you have access):**
-```bash
-# Backup etcd
-ETCDCTL_API=3 etcdctl snapshot save /backup/etcd-snapshot.db \
-  --endpoints=https://127.0.0.1:2379 \
-  --cacert=/etc/kubernetes/pki/etcd/ca.crt \
-  --cert=/etc/kubernetes/pki/etcd/server.crt \
-  --key=/etc/kubernetes/pki/etcd/server.key
-
-# Verify snapshot
-ETCDCTL_API=3 etcdctl snapshot status /backup/etcd-snapshot.db --write-out=table
-```
-
-**Using Velero (if installed):**
-```bash
-# Create backup
-velero backup create <backup-name> --include-namespaces <namespace>
-
-# List backups
-velero backup get
-
-# Restore from backup
-velero restore create --from-backup <backup-name>
-
-# Check restore status
-velero restore describe <restore-name>
+# 7. Review and restrict permissions
+terraform providers
+# Check provider authentication methods
 ```
 
 ---
 
-## Useful Commands Reference
+## Monitoring and Alerting
 
-### Context and Config
+### State Monitoring
+
 ```bash
-# List contexts
-kubectl config get-contexts
+# Monitor state changes
+# Script to run periodically
+#!/bin/bash
+STATE_FILE="s3://bucket/path/terraform.tfstate"
+LAST_SERIAL=$(cat last-serial.txt)
 
-# Switch context
-kubectl config use-context <context-name>
+CURRENT_SERIAL=$(aws s3 cp $STATE_FILE - | jq -r '.serial')
 
-# Set default namespace
-kubectl config set-context --current --namespace=<namespace>
+if [ "$CURRENT_SERIAL" != "$LAST_SERIAL" ]; then
+  echo "State changed: serial $LAST_SERIAL -> $CURRENT_SERIAL"
+  # Send notification
+  echo "$CURRENT_SERIAL" > last-serial.txt
+fi
 ```
 
-### Resource Management
+### Drift Monitoring
+
 ```bash
-# Scale deployment
-kubectl scale deployment <deployment-name> -n <namespace> --replicas=<count>
+# Continuous drift detection
+#!/bin/bash
+cd /path/to/terraform
 
-# Restart deployment
-kubectl rollout restart deployment <deployment-name> -n <namespace>
+terraform init -input=false
+terraform plan -detailed-exitcode -out=drift.tfplan
 
-# View rollout history
-kubectl rollout history deployment <deployment-name> -n <namespace>
-
-# Edit resource
-kubectl edit <resource-type> <resource-name> -n <namespace>
-
-# Patch resource
-kubectl patch <resource-type> <resource-name> -n <namespace> -p '<json-patch>'
-```
-
-### Monitoring
-```bash
-# Watch resources
-kubectl get pods -n <namespace> -w
-
-# Get resource as JSON/YAML
-kubectl get <resource-type> <resource-name> -n <namespace> -o yaml
-
-# Get specific field
-kubectl get <resource-type> <resource-name> -n <namespace> -o jsonpath='{.spec.field}'
-
-# List resources with custom columns
-kubectl get pods -n <namespace> -o custom-columns=NAME:.metadata.name,STATUS:.status.phase,NODE:.spec.nodeName
+if [ $? -eq 2 ]; then
+  echo "DRIFT DETECTED"
+  terraform show drift.tfplan > drift-report.txt
+  # Send alert with drift-report.txt
+fi
 ```
 
 ---
 
-## Escalation Guidelines
+## CI/CD Integration
 
-### When to Escalate
+### GitLab CI Example
 
-**Immediate Escalation Required:**
-- Complete cluster outage
-- Security breach detected
-- Data loss or corruption
-- Multiple node failures
-- Control plane issues
+```yaml
+stages:
+  - validate
+  - plan
+  - apply
 
-**Escalation After Initial Troubleshooting:**
-- Persistent performance degradation
-- Recurring pod failures
-- Storage issues affecting multiple applications
-- Network connectivity problems affecting multiple services
+variables:
+  TF_ROOT: ${CI_PROJECT_DIR}
+  TF_STATE_NAME: ${CI_COMMIT_REF_SLUG}
 
-### Escalation Information to Provide
+.terraform:
+  image: hashicorp/terraform:latest
+  before_script:
+    - cd ${TF_ROOT}
+    - terraform init -backend-config="key=${TF_STATE_NAME}.tfstate"
 
-1. Incident description and impact
-2. Timeline of events
-3. Steps already taken
-4. Current cluster state
-5. Relevant logs and metrics
-6. Number of affected users/services
+validate:
+  extends: .terraform
+  stage: validate
+  script:
+    - terraform validate
+    - terraform fmt -check -recursive
 
----
+plan:
+  extends: .terraform
+  stage: plan
+  script:
+    - terraform plan -out=tfplan
+  artifacts:
+    paths:
+      - ${TF_ROOT}/tfplan
 
-## Maintenance Windows
-
-### Pre-Maintenance Checklist
-
-- [ ] Notify stakeholders
-- [ ] Backup critical data
-- [ ] Document current state
-- [ ] Prepare rollback plan
-- [ ] Schedule appropriate window
-- [ ] Verify team availability
-
-### Post-Maintenance Checklist
-
-- [ ] Verify all services running
-- [ ] Check application functionality
-- [ ] Review monitoring dashboards
-- [ ] Update documentation
-- [ ] Notify stakeholders of completion
-- [ ] Schedule post-mortem if issues occurred
+apply:
+  extends: .terraform
+  stage: apply
+  script:
+    - terraform apply tfplan
+  when: manual
+  only:
+    - main
+```
 
 ---
 
-## Additional Resources
+## Useful Resources
 
-- Kubernetes Documentation: https://kubernetes.io/docs/
-- kubectl Cheat Sheet: https://kubernetes.io/docs/reference/kubectl/cheatsheet/
-- CNCF Landscape: https://landscape.cncf.io/
-- Kubernetes Slack: https://kubernetes.slack.com/
+- Terraform Documentation: https://www.terraform.io/docs/
+- Terraform Registry: https://registry.terraform.io/
+- Terraform Best Practices: https://www.terraform-best-practices.com/
+- State Management Guide: https://www.terraform.io/docs/language/state/
 
 ---
 
